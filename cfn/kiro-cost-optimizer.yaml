@@ -338,7 +338,9 @@ Resources:
           TIER_ORDER = ['Pro', 'Pro+', 'Pro Max', 'Power']
           TIER_MAP = {
               'PRO': 'Pro', 'PRO+': 'Pro+', 'PROPLUS': 'Pro+',
+              'PRO_PLUS': 'Pro+',
               'PRO MAX': 'Pro Max', 'PROMAX': 'Pro Max',
+              'PRO_MAX': 'Pro Max',
               'POWER': 'Power',
           }
 
@@ -1003,7 +1005,9 @@ Resources:
           TIER_ORDER = ['Pro', 'Pro+', 'Pro Max', 'Power']
           TIER_MAP = {
               'PRO': 'Pro', 'PRO+': 'Pro+', 'PROPLUS': 'Pro+',
+              'PRO_PLUS': 'Pro+',
               'PRO MAX': 'Pro Max', 'PROMAX': 'Pro Max',
+              'PRO_MAX': 'Pro Max',
               'POWER': 'Power',
           }
 

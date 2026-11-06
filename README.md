@@ -85,6 +85,8 @@ The Lambda collects all `.csv` files for a date and sums credits per user across
 
 Reference: [Kiro Enterprise Billing](https://kiro.dev/docs/cli/enterprise/billing/) (subject to change)
 
+The `Subscription_Tier` value in the Kiro CSVs is mapped to these tiers (case-insensitive): `PRO`, `PRO+` / `PRO_PLUS` / `PROPLUS`, `PRO MAX` / `PRO_MAX` / `PROMAX`, and `POWER`. Kiro currently writes `PRO_MAX` and `PRO_PLUS` with underscores. A value outside this list is treated as Pro for the recommendation maths, and its Usage % shows `-`.
+
 The report produces a unified "Cost Optimization Recommendations" section with both upgrade and downgrade suggestions.
 
 - Upgrades (always active): the Lambda computes each user's total monthly cost on their current tier (`base + overage × $0.04`) from MTD usage and recommends the cheapest higher tier whose total cost is at or below what they already pay. The recommendation either saves money or, at break-even, costs the same while granting more credits. It can skip tiers (e.g. a heavy Pro user straight to Pro Max).
