@@ -21,6 +21,10 @@ Metadata:
         Parameters:
           - NotificationEmail
           - NotificationFrequency
+      - Label:
+          default: Security Configuration
+        Parameters:
+          - PermissionsBoundaryArn
 
 Parameters:
   UseExistingBucket:
@@ -87,6 +91,17 @@ Parameters:
       "1" = daily, "7" = weekly (Mondays), "30" = monthly (1st of month).
       All runs fire at 8 AM UTC.
 
+  PermissionsBoundaryArn:
+    Type: String
+    AllowedPattern: "^$|^arn:aws[a-z-]*:iam::[0-9]{12}:policy/[A-Za-z0-9+=,.@_/-]+$"
+    ConstraintDescription: >
+      Must be empty or a valid IAM managed policy ARN
+      (arn:aws:iam::<account-id>:policy/<name>).
+    Description: >
+      ARN of the IAM managed policy set as the permissions boundary on the
+      Lambda execution role created by this stack. Required; set to an
+      empty string to create the role without a boundary.
+
 Rules:
   # A new bucket is always created in the stack's Region, but Kiro only
   # delivers reports to a bucket in the Kiro profile's Region. Without this
@@ -119,6 +134,7 @@ Mappings:
 Conditions:
   CreateNewBucket: !Equals [!Ref UseExistingBucket, "false"]
   HasBucketName: !Not [!Equals [!Ref BucketName, ""]]
+  HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, ""]]
 
 Resources:
   # ========================================================================
@@ -228,6 +244,10 @@ Resources:
             Principal:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
+      PermissionsBoundary: !If
+        - HasPermissionsBoundary
+        - !Ref PermissionsBoundaryArn
+        - !Ref "AWS::NoValue"
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
@@ -297,10 +317,35 @@ Resources:
               - dynamodb:Query
             Resource: !GetAtt UsageTable.Arn
 
+  # ========================================================================
+  # CLOUDWATCH LOG GROUPS (7-day retention, one per Lambda)
+  # Created explicitly so retention is enforced; Lambda would otherwise
+  # auto-create a log group that never expires.
+  # ========================================================================
+  ProcessReportsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-process-kiro-reports"
+      RetentionInDays: 7
+
+  EmailNotificationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-process-kiro-notification"
+      RetentionInDays: 7
+
+  BackfillLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-process-kiro-backfill"
+      RetentionInDays: 7
+
   ProcessReportsLambda:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-process-kiro-reports"
+      LoggingConfig:
+        LogGroup: !Ref ProcessReportsLogGroup
       Runtime: python3.12
       Handler: index.lambda_handler
       Role: !GetAtt ProcessReportsLambdaRole.Arn
@@ -338,7 +383,9 @@ Resources:
           TIER_ORDER = ['Pro', 'Pro+', 'Pro Max', 'Power']
           TIER_MAP = {
               'PRO': 'Pro', 'PRO+': 'Pro+', 'PROPLUS': 'Pro+',
+              'PRO_PLUS': 'Pro+',
               'PRO MAX': 'Pro Max', 'PROMAX': 'Pro Max',
+              'PRO_MAX': 'Pro Max',
               'POWER': 'Power',
           }
 
@@ -876,6 +923,8 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-process-kiro-notification"
+      LoggingConfig:
+        LogGroup: !Ref EmailNotificationLogGroup
       Runtime: python3.12
       Handler: index.lambda_handler
       Role: !GetAtt ProcessReportsLambdaRole.Arn
@@ -966,6 +1015,8 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-process-kiro-backfill"
+      LoggingConfig:
+        LogGroup: !Ref BackfillLogGroup
       Runtime: python3.12
       Handler: index.lambda_handler
       Role: !GetAtt ProcessReportsLambdaRole.Arn
@@ -1003,7 +1054,9 @@ Resources:
           TIER_ORDER = ['Pro', 'Pro+', 'Pro Max', 'Power']
           TIER_MAP = {
               'PRO': 'Pro', 'PRO+': 'Pro+', 'PROPLUS': 'Pro+',
+              'PRO_PLUS': 'Pro+',
               'PRO MAX': 'Pro Max', 'PROMAX': 'Pro Max',
+              'PRO_MAX': 'Pro Max',
               'POWER': 'Power',
           }
 

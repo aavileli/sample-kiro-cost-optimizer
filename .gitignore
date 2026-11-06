@@ -9,3 +9,11 @@
 response.json
 out.json
 *.tmp
+
+# OpenTofu / Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+tofu/.build/
+tofu/.terraform.lock.hcl

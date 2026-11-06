@@ -21,18 +21,43 @@ aws cloudformation deploy \
   --region us-east-1 \
   --template-file cfn/kiro-cost-optimizer.yaml \
   --stack-name kiro-cost-optimizer \
+  --s3-bucket <bucket-for-template-upload> \
   --parameter-overrides \
       UseExistingBucket=false \
       ReportPrefix=kiro-user-activity \
       KiroProfileRegion=us-east-1 \
       NotificationEmail=your-email@example.com \
       NotificationFrequency=1 \
+      PermissionsBoundaryArn=arn:aws:iam::<account-id>:policy/SecOps-Boundary \
   --capabilities CAPABILITY_IAM
 ```
+
+The template is larger than CloudFormation's 51,200-byte direct-upload limit, so `--s3-bucket` (any bucket you can write to in the same Region) is required. Lambda logs go to CloudWatch log groups created by the stack with 7-day retention.
 
 `NotificationFrequency`: `1` = daily, `7` = weekly (Mondays), `30` = monthly (1st).
 
 `KiroProfileRegion` must be the Region where your Kiro profile was installed (`us-east-1` or `eu-central-1`). With `UseExistingBucket=false`, deploy the stack in that same Region (`--region`), because the new bucket is created in the stack's Region and Kiro only delivers reports to a bucket in the profile's Region. A mismatched deploy fails with a `Parameter validation failed` error before any resources are created, leaving an empty stack in `ROLLBACK_COMPLETE`; delete it (`aws cloudformation delete-stack`) and redeploy in the right Region. With `UseExistingBucket=true`, the stack can run in any Region, but the existing bucket must be in the Kiro profile's Region.
+
+`PermissionsBoundaryArn` is required and is set on the Lambda execution role. Pass `PermissionsBoundaryArn=""` to create the role without a boundary, or another policy ARN to use a different one. The role's permissions are the intersection of its policies and the boundary, so the boundary must allow the S3, SNS, DynamoDB and CloudWatch Logs actions the Lambdas use.
+
+### Deploy with OpenTofu
+
+The [`tofu/`](tofu/) directory is an OpenTofu module that deploys the same resources as the CloudFormation template.
+
+```hcl
+module "kiro_cost_optimizer" {
+  source = "./tofu"
+
+  notification_email     = "your-email@example.com"
+  notification_frequency = "1"
+  kiro_profile_region    = "us-east-1"
+  permissions_boundary_arn = "arn:aws:iam::<account-id>:policy/SecOps-Boundary"
+}
+```
+
+Variables mirror the CloudFormation parameters in snake_case (`use_existing_bucket`, `bucket_name`, `report_prefix`, `kiro_profile_region`, `notification_email`, `notification_frequency`, `permissions_boundary_arn`), and the outputs match the stack outputs. Requires OpenTofu 1.6+ and the AWS provider 6.0+. Run `tofu test` inside `tofu/` for the offline module tests.
+
+The Lambda code in `tofu/lambda/` is a verbatim copy of the inline code in the CloudFormation template. Update both when changing handler logic. Instead of the CloudFormation custom resource, the module runs the backfill with `aws_lambda_invocation` (only when `use_existing_bucket = true`; disable with `enable_backfill = false`). Unlike the custom resource, a backfill error fails the apply.
 
 ### Enable Reports in Kiro Console
 
@@ -85,6 +110,8 @@ The Lambda collects all `.csv` files for a date and sums credits per user across
 
 Reference: [Kiro Enterprise Billing](https://kiro.dev/docs/cli/enterprise/billing/) (subject to change)
 
+The `Subscription_Tier` value in the Kiro CSVs is mapped to these tiers (case-insensitive): `PRO`, `PRO+` / `PRO_PLUS` / `PROPLUS`, `PRO MAX` / `PRO_MAX` / `PROMAX`, and `POWER`. Kiro currently writes `PRO_MAX` and `PRO_PLUS` with underscores. A value outside this list is treated as Pro for the recommendation maths, and its Usage % shows `-`, so a `-` in that column for a user on a higher tier means the name needs adding to `TIER_MAP`.
+
 The report produces a unified "Cost Optimization Recommendations" section with both upgrade and downgrade suggestions.
 
 - Upgrades (always active): the Lambda computes each user's total monthly cost on their current tier (`base + overage × $0.04`) from MTD usage and recommends the cheapest higher tier whose total cost is at or below what they already pay. The recommendation either saves money or, at break-even, costs the same while granting more credits. It can skip tiers (e.g. a heavy Pro user straight to Pro Max).
@@ -95,12 +122,15 @@ The report produces a unified "Cost Optimization Recommendations" section with b
 
 ### Using an existing bucket
 
-Use the same [Deploy](#deploy) command, overriding these two parameters:
+Use the same [Deploy](#deploy) command, overriding these parameters:
 
 ```bash
       UseExistingBucket=true \
       BucketName=my-existing-kiro-reports-bucket \
+      ReportPrefix=<the prefix Kiro already writes to> \
 ```
+
+`ReportPrefix` must match the prefix configured in the Kiro console, because the Lambdas look for CSVs under `{ReportPrefix}/AWSLogs/<account-id>/KiroLogs/user_report/<region>/`. Deploy into the same AWS account as the Kiro profile. If the bucket is encrypted with SSE-KMS, the Lambda role also needs KMS permissions, which this stack does not grant. If the bucket is in another account, its bucket policy must allow the Lambda role. The stack writes only to `{ReportPrefix}/reports/` in the bucket.
 
 After deployment, check the `RequiredBucketPolicyStatement` stack output for the policy statement to add to your bucket manually. The stack applies no lifecycle rule to an existing bucket; the `OptionalS3LifecyclePolicy` output supplies a ready-to-apply rule that expires this stack's reports after 90 days, scoped to `{ReportPrefix}/reports/` so your Kiro CSVs are untouched. Note that `put-bucket-lifecycle-configuration` replaces a bucket's entire lifecycle configuration — merge the rule into your existing rules rather than applying it standalone.
 
@@ -112,17 +142,34 @@ When installing against an existing bucket that already has reports and it's not
 - Skips when `UseExistingBucket=false` or when run on the 1st.
 - Best-effort: errors are logged but never block or roll back the stack.
 
-To (re)seed specific days manually, invoke the processing Lambda per date with `{"date": "YYYY-MM-DD"}` (see [Manual Lambda Invocation](#manual-lambda-invocation)).
+To (re)seed specific days manually, invoke the processing Lambda per date with `{"date": "YYYY-MM-DD"}` (see [Testing](#testing)).
+
+To rerun the whole backfill (for example after changing the Lambda code) and regenerate the month-to-date report, invoke the backfill Lambda directly. A manual run is forced by default, bypassing the skip rules; pass `{"force": false}` to keep them. Then invoke the notification Lambda to email the new report.
+
+```bash
+aws lambda invoke --function-name kiro-cost-optimizer-process-kiro-backfill \
+  --cli-binary-format raw-in-base64-out --payload '{}' backfill-out.json && cat backfill-out.json
+aws lambda invoke --function-name kiro-cost-optimizer-process-kiro-notification \
+  --cli-binary-format raw-in-base64-out notify-out.json && cat notify-out.json
+```
+
+With OpenTofu the backfill runs as `aws_lambda_invocation` when the resource is created, only if `use_existing_bucket = true` (set `enable_backfill = false` to skip it). It is not rerun on later applies unless the resource is replaced.
 
 ## Customization
 
-All Lambda source code is embedded inline in `cfn/kiro-cost-optimizer.yaml` (under each function's `Code` → `ZipFile`). Edit the inline code and redeploy to change behavior.
+All Lambda source code is embedded inline in `cfn/kiro-cost-optimizer.yaml` (under each function's `Code` → `ZipFile`). Edit the inline code and redeploy to change behavior. The OpenTofu module ships the same code as files in `tofu/lambda/`; copy any change there too (`process_reports.py`, `email_notification.py`, `backfill.py`). `tofu/lambda/cfnresponse.py` is a shim and is not part of the template.
 
 Tier limits — edit the `TIER_LIMITS` dictionary in the inline Lambda code:
 
 ```python
 TIER_LIMITS = {'Pro': 1000, 'Pro+': 2000, 'Pro Max': 5000, 'Power': 10000}
 ```
+
+Tier names as they appear in the CSV are mapped by `TIER_MAP`, which exists in both the processing and backfill Lambdas. Update both.
+
+CloudWatch Logs — each Lambda writes to its own log group (`/aws/lambda/<stack-name>-process-kiro-reports`, `-process-kiro-notification`, `-process-kiro-backfill`) with 7-day retention (`RetentionInDays` in the template, `retention_in_days` in the module). The log groups are deleted with the stack.
+
+Permissions boundary — see `PermissionsBoundaryArn` (CloudFormation) / `permissions_boundary_arn` (OpenTofu).
 
 Processing schedule — hardcoded to 3:00 AM UTC (`cron(0 3 * * ? *)`) in the `DailyProcessingRule` EventBridge rule, since Kiro delivers at a fixed 2:00 AM UTC. Edit its `ScheduleExpression` to change. The notification schedule is configurable at deploy time via `NotificationFrequency`.
 
@@ -134,9 +181,22 @@ aws lambda invoke \
   --function-name kiro-cost-optimizer-process-kiro-reports \
   --payload '{}' response.json && cat response.json
 
-# Logs
+# Process a specific day (backfill a date)
+aws lambda invoke \
+  --function-name kiro-cost-optimizer-process-kiro-reports \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"date": "YYYY-MM-DD"}' response.json && cat response.json
+
+# Email the latest archived report now (instead of waiting for the schedule)
+aws lambda invoke \
+  --function-name kiro-cost-optimizer-process-kiro-notification \
+  --cli-binary-format raw-in-base64-out notify-out.json && cat notify-out.json
+
+# Logs (retained for 7 days)
 aws logs tail /aws/lambda/kiro-cost-optimizer-process-kiro-reports --follow
 ```
+
+Add `--profile <name> --region <region>` to the commands if your CLI needs them. The notification Lambda sends the newest `.txt` under `{ReportPrefix}/reports/`; it does not generate a new report. Run the processing or backfill Lambda first if you want a fresh one.
 
 ## Sample Output
 
@@ -195,7 +255,13 @@ Variants:
 
 **Lambda execution errors** — check CloudWatch Logs; verify S3 read permissions and that bucket name/prefix match parameters.
 
-**Email not received** — Confirm the SNS subscription, check spam, review CloudWatch Logs for publish errors.
+**Email not received** — Confirm the SNS subscription, check spam, review CloudWatch Logs for publish errors. The email is only sent on the `NotificationFrequency` schedule (for `30`, the 1st of the month at 8 AM UTC), so invoke the notification Lambda to get one sooner.
+
+**Usage % shows `-` or recommendations look wrong** — the `Subscription_Tier` value in the CSV isn't in `TIER_MAP`, so the user is treated as Pro. Add the exact value to `TIER_MAP` in the processing and backfill Lambdas, redeploy, then rerun the backfill to regenerate the report (see [Mid-month installs](#mid-month-installs-backfill)).
+
+**Logs missing** — CloudWatch Logs are kept for 7 days, so older invocations are gone by design.
+
+**`Templates with a size greater than 51,200 bytes` on deploy** — the template exceeds the direct-upload limit. Add `--s3-bucket <bucket>` (and optionally `--s3-prefix`) to `aws cloudformation deploy`. The uploaded template object stays in that bucket until you delete it.
 
 ## Cleaning Up
 
@@ -203,7 +269,7 @@ Variants:
 aws cloudformation delete-stack --stack-name kiro-cost-optimizer
 ```
 
-Removes the Lambdas, EventBridge rules, SNS topic, DynamoDB table, and (if the stack created it) the S3 bucket. An existing bucket (`UseExistingBucket=true`) and its contents are retained.
+Removes the Lambdas, their CloudWatch log groups, the IAM role, EventBridge rules, SNS topic, DynamoDB table, and (if the stack created it) the S3 bucket. An existing bucket (`UseExistingBucket=true`) and its contents are retained, including the archived reports under `{ReportPrefix}/reports/` and any template objects uploaded with `--s3-bucket`. With OpenTofu, run `tofu destroy` instead.
 
 Even without teardown, the DynamoDB table never grows unbounded: every row (per-user daily rows and the per-month user roster) is written with an `ExpiresAt` timestamp, and DynamoDB TTL auto-deletes each row 90 days after it was written. TTL deletes are performed by DynamoDB itself, so they incur no IAM permission or write cost, and are best-effort (typically within a few days of expiry). 90 days comfortably outlives the longest read window (the current month), so month-to-date reports are never affected. TTL deletion applies only to rows written after this feature was deployed; rows written earlier have no `ExpiresAt` and persist until removed manually or with the stack.
 
@@ -213,6 +279,7 @@ The archived reports are bounded to match: when the stack creates the bucket, an
 
 - S3 encryption (AES256), public access blocked, versioning enabled for audit trail
 - Lambda follows least-privilege IAM
+- Lambda execution role carries the permissions boundary you supply (`PermissionsBoundaryArn` / `permissions_boundary_arn`)
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for reporting security issues.
 
@@ -221,8 +288,12 @@ See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for reporting s
 ```
 .
 ├── README.md
-└── cfn/
-    └── kiro-cost-optimizer.yaml  # Complete stack; all Lambda code embedded inline
+├── cfn/
+│   └── kiro-cost-optimizer.yaml  # Complete stack; all Lambda code embedded inline
+└── tofu/                         # OpenTofu module equivalent of the stack
+    ├── main.tf, variables.tf, outputs.tf, versions.tf
+    ├── lambda/                   # Lambda sources (copied from the CFN inline code)
+    └── tests/                    # Offline `tofu test` suite
 ```
 
 
